@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ def build_server_command(
     model: dict[str, Any],
     host: str,
     port: int,
+    case: dict[str, Any] | None = None,
 ) -> list[str]:
     cmd = ["vllm", "serve", str(model["model"])]
     cmd.extend(["--host", host, "--port", str(port)])
@@ -30,8 +32,10 @@ def build_server_command(
 
     append_cli_value(cmd, "--dtype", model.get("dtype"))
 
-    for key, value in dict(model.get("server_args", {})).items():
-        append_cli_value(cmd, f"--{kebab(key)}", value)
+    append_server_args(cmd, model.get("server_args", {}))
+
+    if case:
+        append_server_args(cmd, case.get("server_args", {}))
 
     mtp = dict(model.get("mtp", {}) or {})
     if mtp.get("enabled"):
@@ -44,8 +48,20 @@ def build_server_command(
             append_cli_value(cmd, "--spec-tokens", mtp.get("spec_tokens"))
         cmd.extend([str(x) for x in mtp.get("extra_args", [])])
 
-    cmd.extend([str(x) for x in model.get("extra_server_args", [])])
     return cmd
+
+
+def append_server_args(cmd: list[str], server_args: Any) -> None:
+    if not server_args:
+        return
+    if isinstance(server_args, dict):
+        for key, value in server_args.items():
+            append_cli_value(cmd, f"--{kebab(key)}", value)
+        return
+    if isinstance(server_args, (list, tuple)):
+        cmd.extend([str(value) for value in server_args])
+        return
+    raise TypeError(f"server_args must be a dict/list/tuple, got: {type(server_args).__name__}")
 
 
 def build_perf_command(
@@ -134,3 +150,7 @@ def build_perf_command(
 
 def command_to_text(cmd: list[str]) -> str:
     return json.dumps(cmd, ensure_ascii=False)
+
+
+def command_to_shell(cmd: list[str]) -> str:
+    return shlex.join(cmd)

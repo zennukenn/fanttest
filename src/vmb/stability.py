@@ -4,6 +4,7 @@ import asyncio
 import difflib
 import json
 import platform
+import shlex
 import subprocess
 from datetime import datetime, timezone
 import urllib.error
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Task
+from .progress import log
 from .util import ensure_dir, normalize_text, short_hash
 
 
@@ -23,7 +25,14 @@ async def run_stability_task(
     result_root: Path,
     update_baseline: bool,
 ) -> None:
+    log_dir = ensure_dir(result_root / "runs" / task.id)
+    client_command = build_client_command(task, host, port)
+    log("stability_client_command", task.id, command=client_command)
+    (log_dir / "client_command.txt").write_text(client_command + "\n", encoding="utf-8")
+
+    log("stability_request_start", task.id)
     completion = await asyncio.to_thread(request_completion, task, host, port)
+    log("stability_response_received", task.id)
     model_sig = model_signature(task.model)
     case_sig = case_signature(task.case)
 
@@ -39,6 +48,7 @@ async def run_stability_task(
 
     current_record = build_record(task, gpus, completion, model_sig, case_sig)
     write_json(current_path, current_record)
+    log("stability_current_written", task.id, path=current_path, output_hash=current_record["output_hash"])
 
     report: dict[str, Any] = {
         "schema_version": 2,
@@ -50,6 +60,11 @@ async def run_stability_task(
         "baseline_path": str(baseline_path),
         "current_path": str(current_path),
         "current_hash": current_record["output_hash"],
+        "expected": task.case.get("expected"),
+        "expected_matched": match_expected(
+            current_record["normalized_output"],
+            task.case.get("expected"),
+        ),
         "updated_baseline": False,
         "changed": False,
     }
@@ -60,12 +75,21 @@ async def run_stability_task(
         write_json(baseline_path, current_record)
         report["updated_baseline"] = True
         write_json(report_path, report)
+        log("stability_baseline_updated", task.id, baseline=baseline_path, report=report_path)
         return
 
     baseline_record = read_baseline(baseline_path, legacy_baseline_path)
     changed = has_changed(task.case, baseline_record, current_record)
     report["baseline_hash"] = baseline_record["output_hash"]
     report["changed"] = changed
+    log(
+        "stability_compared",
+        task.id,
+        changed=changed,
+        expected_matched=report["expected_matched"],
+        baseline_hash=report["baseline_hash"],
+        current_hash=report["current_hash"],
+    )
 
     if changed:
         diff = difflib.unified_diff(
@@ -76,8 +100,10 @@ async def run_stability_task(
         )
         diff_path.write_text("".join(diff), encoding="utf-8")
         report["diff_path"] = str(diff_path)
+        log("stability_diff_written", task.id, path=diff_path)
 
     write_json(report_path, report)
+    log("stability_report_written", task.id, path=report_path)
 
 
 def request_completion(task: Task, host: str, port: int) -> dict[str, Any]:
@@ -105,6 +131,26 @@ def request_completion(task: Task, host: str, port: int) -> dict[str, Any]:
         "response": payload,
         "output": extract_text(payload),
     }
+
+
+def build_client_command(task: Task, host: str, port: int) -> str:
+    model = task.model
+    case = task.case
+    endpoint = case.get("endpoint") or model.get("bench", {}).get("endpoint")
+    if endpoint is None:
+        endpoint = "/v1/chat/completions" if model.get("type") in {"vl", "vl_moe"} else "/v1/completions"
+    body = build_request_body(task, endpoint)
+    return shlex.join(
+        [
+            "curl",
+            "-sS",
+            f"http://{host}:{port}{endpoint}",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            json.dumps(body, ensure_ascii=False),
+        ]
+    )
 
 
 def build_request_body(task: Task, endpoint: str) -> dict[str, Any]:
@@ -159,6 +205,7 @@ def build_record(
         "model_config_hash": model_sig,
         "case_id": task.case["id"],
         "case_config_hash": case_sig,
+        "expected": task.case.get("expected"),
         "request_hash": short_hash(request_body, 32),
         "output_hash": short_hash(normalized_output, 32),
         "gpus": gpus,
@@ -211,6 +258,16 @@ def has_changed(
     raise ValueError(f"Unsupported stability compare mode: {mode}")
 
 
+def match_expected(output: str, expected: Any) -> bool | None:
+    if expected is None:
+        return None
+    if isinstance(expected, str):
+        return expected in output
+    if isinstance(expected, list):
+        return all(str(item) in output for item in expected)
+    return str(expected) in output
+
+
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -234,4 +291,10 @@ def model_signature(model: dict[str, Any]) -> str:
 
 
 def case_signature(case: dict[str, Any]) -> str:
-    return short_hash({"sampling": case.get("sampling", {}), "compare": case.get("compare", {})})
+    return short_hash(
+        {
+            "sampling": case.get("sampling", {}),
+            "compare": case.get("compare", {}),
+            "expected": case.get("expected"),
+        }
+    )

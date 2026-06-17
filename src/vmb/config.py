@@ -57,18 +57,62 @@ def normalize_model(model: dict[str, Any]) -> dict[str, Any]:
     item.setdefault("pp", 1)
     item.setdefault("enable_ep", False)
     item.setdefault("server_args", {})
-    item.setdefault("extra_server_args", [])
     item.setdefault("bench", {})
     if "model" not in item:
         raise ValueError(f"Model entry {item['id']} is missing required key 'model'")
     return item
 
 
-def normalize_case(case: dict[str, Any], prefix: str) -> dict[str, Any]:
-    item = dict(case)
-    item.setdefault("id", f"{prefix}_{short_hash(item)}")
+def normalize_case(case: Any, prefix: str) -> dict[str, Any]:
+    if prefix == "perf":
+        item = normalize_perf_case(case)
+    else:
+        if not isinstance(case, dict):
+            raise TypeError(f"{prefix} case must be a dict, got: {type(case).__name__}")
+        item = dict(case)
+    item.setdefault("id", default_case_id(item, prefix))
     item["id"] = sanitize_id(str(item["id"]))
     return item
+
+
+def normalize_perf_case(case: Any) -> dict[str, Any]:
+    if isinstance(case, dict):
+        item = dict(case)
+    elif isinstance(case, (list, tuple)):
+        if len(case) not in {3, 4, 5}:
+            raise ValueError(
+                "Perf case list/tuple must be "
+                "[max_concurrency, input_len, output_len], "
+                "[max_concurrency, input_len, output_len, num_prompts], or "
+                "[max_concurrency, input_len, output_len, num_prompts, temperature]"
+            )
+        item = {
+            "max_concurrency": case[0],
+            "input_len": case[1],
+            "output_len": case[2],
+            "num_prompts": case[3] if len(case) >= 4 else 200,
+            "temperature": case[4] if len(case) >= 5 else 0,
+            "server_args": {
+                "max_num_seqs": case[0],
+            },
+        }
+    else:
+        raise TypeError(f"perf case must be a dict/list/tuple, got: {type(case).__name__}")
+
+    item.setdefault("num_prompts", 200)
+    item.setdefault("temperature", 0)
+    if "max_concurrency" in item:
+        server_args = item.get("server_args", {})
+        if isinstance(server_args, dict):
+            server_args.setdefault("max_num_seqs", item["max_concurrency"])
+            item["server_args"] = server_args
+    return item
+
+
+def default_case_id(item: dict[str, Any], prefix: str) -> str:
+    if prefix == "perf" and {"max_concurrency", "input_len", "output_len"} <= set(item):
+        return f"seq{item['max_concurrency']}_i{item['input_len']}_o{item['output_len']}"
+    return f"{prefix}_{short_hash(item)}"
 
 
 def required_gpus(model: dict[str, Any]) -> int:
@@ -92,14 +136,14 @@ def expand_tasks(
 
     if kind in {"perf", "all"}:
         for model in selected:
-            cases = model.get("perf_cases") or config.perf_cases
+            cases = [normalize_case(c, "perf") for c in (model.get("perf_cases") or config.perf_cases)]
             for case in cases:
                 task_id = sanitize_id(f"perf_{model['id']}_{case['id']}")
                 tasks.append(Task("perf", model, case, task_id, required_gpus(model)))
 
     if kind in {"stability", "all"}:
         for model in selected:
-            cases = model.get("stability_cases") or config.stability_cases
+            cases = [normalize_case(c, "stability") for c in (model.get("stability_cases") or config.stability_cases)]
             for case in cases:
                 task_id = sanitize_id(f"stability_{model['id']}_{case['id']}")
                 tasks.append(Task("stability", model, case, task_id, required_gpus(model)))
