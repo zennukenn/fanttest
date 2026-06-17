@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 import difflib
 import json
+import platform
+import subprocess
+from datetime import datetime, timezone
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 from .config import Task
-from .util import ensure_dir, normalize_text, short_hash, stable_json
+from .util import ensure_dir, normalize_text, short_hash
 
 
 async def run_stability_task(
@@ -20,7 +23,7 @@ async def run_stability_task(
     result_root: Path,
     update_baseline: bool,
 ) -> None:
-    output = await asyncio.to_thread(request_output, task, host, port)
+    completion = await asyncio.to_thread(request_completion, task, host, port)
     model_sig = model_signature(task.model)
     case_sig = case_signature(task.case)
 
@@ -28,52 +31,56 @@ async def run_stability_task(
     report_dir = ensure_dir(result_root / "stability" / "reports" / task.model["id"])
     current_dir = ensure_dir(result_root / "stability" / "current" / task.model["id"])
 
-    baseline_path = base_dir / f"{task.case['id']}_{model_sig}_{case_sig}.txt"
-    current_path = current_dir / f"{task.case['id']}_{model_sig}_{case_sig}.txt"
+    baseline_path = base_dir / f"{task.case['id']}_{model_sig}_{case_sig}.json"
+    legacy_baseline_path = base_dir / f"{task.case['id']}_{model_sig}_{case_sig}.txt"
+    current_path = current_dir / f"{task.case['id']}_{model_sig}_{case_sig}.json"
     report_path = report_dir / f"{task.id}.json"
     diff_path = report_dir / f"{task.id}.diff"
 
-    current_path.write_text(output, encoding="utf-8")
+    current_record = build_record(task, gpus, completion, model_sig, case_sig)
+    write_json(current_path, current_record)
 
-    normalized_output = normalize_text(output)
     report: dict[str, Any] = {
+        "schema_version": 2,
         "task_id": task.id,
         "model_id": task.model["id"],
         "case_id": task.case["id"],
+        "compare_mode": task.case.get("compare", {}).get("mode", "exact_normalized"),
         "gpus": gpus,
         "baseline_path": str(baseline_path),
         "current_path": str(current_path),
-        "current_hash": short_hash(normalized_output, 32),
+        "current_hash": current_record["output_hash"],
         "updated_baseline": False,
         "changed": False,
     }
 
-    if update_baseline or not baseline_path.exists():
-        baseline_path.write_text(output, encoding="utf-8")
+    if update_baseline or (
+        not baseline_path.exists() and not legacy_baseline_path.exists()
+    ):
+        write_json(baseline_path, current_record)
         report["updated_baseline"] = True
-        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json(report_path, report)
         return
 
-    baseline = baseline_path.read_text(encoding="utf-8")
-    normalized_baseline = normalize_text(baseline)
-    changed = normalized_baseline != normalized_output
-    report["baseline_hash"] = short_hash(normalized_baseline, 32)
+    baseline_record = read_baseline(baseline_path, legacy_baseline_path)
+    changed = has_changed(task.case, baseline_record, current_record)
+    report["baseline_hash"] = baseline_record["output_hash"]
     report["changed"] = changed
 
     if changed:
         diff = difflib.unified_diff(
-            normalized_baseline.splitlines(keepends=True),
-            normalized_output.splitlines(keepends=True),
+            baseline_record["normalized_output"].splitlines(keepends=True),
+            current_record["normalized_output"].splitlines(keepends=True),
             fromfile=str(baseline_path),
             tofile=str(current_path),
         )
         diff_path.write_text("".join(diff), encoding="utf-8")
         report["diff_path"] = str(diff_path)
 
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(report_path, report)
 
 
-def request_output(task: Task, host: str, port: int) -> str:
+def request_completion(task: Task, host: str, port: int) -> dict[str, Any]:
     model = task.model
     case = task.case
     endpoint = case.get("endpoint") or model.get("bench", {}).get("endpoint")
@@ -91,7 +98,13 @@ def request_output(task: Task, host: str, port: int) -> str:
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
 
-    return extract_text(payload)
+    return {
+        "endpoint": endpoint,
+        "url": url,
+        "request": body,
+        "response": payload,
+        "output": extract_text(payload),
+    }
 
 
 def build_request_body(task: Task, endpoint: str) -> dict[str, Any]:
@@ -122,6 +135,97 @@ def extract_text(payload: dict[str, Any]) -> str:
     if isinstance(content, str):
         return content
     return json.dumps(content, ensure_ascii=False, indent=2)
+
+
+def build_record(
+    task: Task,
+    gpus: list[int],
+    completion: dict[str, Any],
+    model_sig: str,
+    case_sig: str,
+) -> dict[str, Any]:
+    raw_output = completion["output"]
+    normalized_output = normalize_text(raw_output)
+    request_body = completion["request"]
+    response_body = completion["response"]
+    return {
+        "schema_version": 2,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "task_id": task.id,
+        "model_id": task.model["id"],
+        "model": task.model["model"],
+        "served_model_name": task.model.get("served_model_name") or task.model["model"],
+        "model_type": task.model.get("type"),
+        "model_config_hash": model_sig,
+        "case_id": task.case["id"],
+        "case_config_hash": case_sig,
+        "request_hash": short_hash(request_body, 32),
+        "output_hash": short_hash(normalized_output, 32),
+        "gpus": gpus,
+        "endpoint": completion["endpoint"],
+        "url": completion["url"],
+        "request": request_body,
+        "response": response_body,
+        "raw_output": raw_output,
+        "normalized_output": normalized_output,
+        "environment": {
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "vllm_version": vllm_version(),
+        },
+    }
+
+
+def read_baseline(baseline_path: Path, legacy_baseline_path: Path) -> dict[str, Any]:
+    if baseline_path.exists():
+        with open(baseline_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.setdefault("raw_output", data.get("normalized_output", ""))
+        data.setdefault("normalized_output", normalize_text(data["raw_output"]))
+        data.setdefault("output_hash", short_hash(data["normalized_output"], 32))
+        return data
+
+    if legacy_baseline_path.exists():
+        raw_output = legacy_baseline_path.read_text(encoding="utf-8")
+        normalized_output = normalize_text(raw_output)
+        return {
+            "schema_version": 1,
+            "raw_output": raw_output,
+            "normalized_output": normalized_output,
+            "output_hash": short_hash(normalized_output, 32),
+        }
+
+    raise FileNotFoundError(f"Baseline not found: {baseline_path}")
+
+
+def has_changed(
+    case: dict[str, Any],
+    baseline_record: dict[str, Any],
+    current_record: dict[str, Any],
+) -> bool:
+    mode = case.get("compare", {}).get("mode", "exact_normalized")
+    if mode == "exact_raw":
+        return baseline_record.get("raw_output", "") != current_record["raw_output"]
+    if mode in {"exact_normalized", "hash"}:
+        return baseline_record["output_hash"] != current_record["output_hash"]
+    raise ValueError(f"Unsupported stability compare mode: {mode}")
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def vllm_version() -> str:
+    try:
+        output = subprocess.check_output(
+            ["vllm", "--version"],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return "unknown"
+    return output.strip()
 
 
 def model_signature(model: dict[str, Any]) -> str:
