@@ -26,12 +26,19 @@ async def run_stability_task(
     update_baseline: bool,
 ) -> None:
     log_dir = ensure_dir(result_root / "runs" / task.id)
+    client_log_path = log_dir / "client.log"
     client_command = build_client_command(task, host, port)
     log("stability_client_command", task.id, command=client_command)
-    (log_dir / "client_command.txt").write_text(client_command + "\n", encoding="utf-8")
+    write_client_log(client_log_path, f"$ {client_command}\n\n")
 
     log("stability_request_start", task.id)
-    completion = await asyncio.to_thread(request_completion, task, host, port)
+    write_client_log(client_log_path, "request_start\n")
+    try:
+        completion = await asyncio.to_thread(request_completion, task, host, port)
+    except Exception as exc:
+        write_client_log(client_log_path, f"request_failed: {exc!r}\n")
+        raise
+    write_client_log(client_log_path, "response_received\n")
     log("stability_response_received", task.id)
     model_sig = model_signature(task.model)
     case_sig = case_signature(task.case)
@@ -48,6 +55,14 @@ async def run_stability_task(
 
     current_record = build_record(task, gpus, completion, model_sig, case_sig)
     write_json(current_path, current_record)
+    write_client_log(
+        client_log_path,
+        (
+            f"current_path: {current_path}\n"
+            f"output_hash: {current_record['output_hash']}\n"
+            f"raw_output:\n{current_record['raw_output']}\n"
+        ),
+    )
     log("stability_current_written", task.id, path=current_path, output_hash=current_record["output_hash"])
 
     report: dict[str, Any] = {
@@ -75,6 +90,7 @@ async def run_stability_task(
         write_json(baseline_path, current_record)
         report["updated_baseline"] = True
         write_json(report_path, report)
+        write_client_log(client_log_path, f"baseline_updated: {baseline_path}\nreport: {report_path}\n")
         log("stability_baseline_updated", task.id, baseline=baseline_path, report=report_path)
         return
 
@@ -82,6 +98,15 @@ async def run_stability_task(
     changed = has_changed(task.case, baseline_record, current_record)
     report["baseline_hash"] = baseline_record["output_hash"]
     report["changed"] = changed
+    write_client_log(
+        client_log_path,
+        (
+            f"baseline_hash: {report['baseline_hash']}\n"
+            f"current_hash: {report['current_hash']}\n"
+            f"changed: {changed}\n"
+            f"expected_matched: {report['expected_matched']}\n"
+        ),
+    )
     log(
         "stability_compared",
         task.id,
@@ -100,9 +125,11 @@ async def run_stability_task(
         )
         diff_path.write_text("".join(diff), encoding="utf-8")
         report["diff_path"] = str(diff_path)
+        write_client_log(client_log_path, f"diff_path: {diff_path}\n")
         log("stability_diff_written", task.id, path=diff_path)
 
     write_json(report_path, report)
+    write_client_log(client_log_path, f"report: {report_path}\n")
     log("stability_report_written", task.id, path=report_path)
 
 
@@ -270,6 +297,11 @@ def match_expected(output: str, expected: Any) -> bool | None:
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def write_client_log(path: Path, text: str) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(text)
 
 
 def vllm_version() -> str:

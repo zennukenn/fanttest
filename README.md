@@ -123,11 +123,23 @@ pip install -e .
 [max_concurrency, input_len, output_len, num_prompts, temperature]
 ```
 
+如果省略 `num_prompts`，默认值是：
+
+```text
+num_prompts = max_concurrency * GLOBAL["default_num_prompts_multiplier"]
+```
+
+当前默认配置：
+
+```python
+"default_num_prompts_multiplier": 2
+```
+
 例如：
 
 ```python
 "perf_cases": [
-    [1, 1024, 1024],
+    [1, 1024, 1024],          # num_prompts = 2
     [8, 3024, 1024, 200, 0],
 ]
 ```
@@ -205,10 +217,16 @@ vmb --config bench_config.py gpu
 vmb --config bench_config.py plan --kind all
 ```
 
-查看 GPU 探测诊断：
+查看静态 GPU 池：
 
 ```bash
 vmb --config bench_config.py gpu
+```
+
+一条命令运行全部性能测试和稳定性测试：
+
+```bash
+vmb --config bench_config.py run all
 ```
 
 运行所有性能测试：
@@ -271,12 +289,8 @@ vmb --config bench_config.py run perf --model vl_qwen_7b
 ```text
 results/runs/<task_id>/
   manifest.json
-  server_command.txt
-  client_command.txt
-  server.stdout.log
-  server.stderr.log
-  bench.stdout.log
-  bench.stderr.log
+  server.log                   # 服务端命令 + vLLM server stdout/stderr 合并输出
+  client.log                   # 客户端命令 + benchmark/curl 输出
 ```
 
 ## 稳定性验证

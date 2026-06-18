@@ -9,7 +9,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from .args import build_server_command
+from .args import build_server_command, command_to_shell
 from .progress import log
 from .util import ensure_dir
 
@@ -35,8 +35,7 @@ class VllmServer:
         self.ready_timeout_sec = ready_timeout_sec
         self.visible_devices_env = visible_devices_env
         self.process: subprocess.Popen | None = None
-        self.stdout_file = None
-        self.stderr_file = None
+        self.log_file = None
         self.task_id = str(case.get("_task_id", ""))
 
     @property
@@ -58,15 +57,18 @@ class VllmServer:
             port=self.port,
             gpus=env[self.visible_devices_env],
             visible_devices_env=self.visible_devices_env,
-            stdout=self.log_dir / "server.stdout.log",
-            stderr=self.log_dir / "server.stderr.log",
+            log=self.log_dir / "server.log",
         )
-        self.stdout_file = open(self.log_dir / "server.stdout.log", "w", encoding="utf-8")
-        self.stderr_file = open(self.log_dir / "server.stderr.log", "w", encoding="utf-8")
+        self.log_file = open(self.log_dir / "server.log", "w", encoding="utf-8")
+        self.log_file.write(
+            f"$ {self.visible_devices_env}={env[self.visible_devices_env]} "
+            f"{command_to_shell(self.command())}\n\n"
+        )
+        self.log_file.flush()
         self.process = subprocess.Popen(
             self.command(),
-            stdout=self.stdout_file,
-            stderr=self.stderr_file,
+            stdout=self.log_file,
+            stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
         )
@@ -106,7 +108,5 @@ class VllmServer:
                     os.killpg(self.process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-        if self.stdout_file:
-            self.stdout_file.close()
-        if self.stderr_file:
-            self.stderr_file.close()
+        if self.log_file:
+            self.log_file.close()
